@@ -31,6 +31,8 @@ use tokio::sync::{broadcast, RwLock};
 const LISTEN_ADDR: &str = "0.0.0.0:8765";
 const POLL_INTERVAL: Duration = Duration::from_micros(33_333); // ~30 Hz
 const MAX_HISTORY: usize = 900; // 30 s × 30 Hz
+const CMD_TIMEOUT: Duration = Duration::from_secs(5);
+const WS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── Global state ───────────────────────────────────────────────────────────
 
@@ -54,6 +56,9 @@ static STATE: LazyLock<Global> = LazyLock::new(|| {
 
 #[derive(Debug, Error)]
 enum CollectError {
+    #[error("`{cmd}` timed out after {timeout_secs}s")]
+    Timeout { cmd: String, timeout_secs: u64 },
+
     #[error("failed to execute `{cmd}`: {source}")]
     Spawn { cmd: String, source: std::io::Error },
 
@@ -108,24 +113,39 @@ struct GpuStats {
 // ── Shell command helper ───────────────────────────────────────────────────
 
 async fn run_cmd(cmd: &str) -> Result<String, CollectError> {
-    let output = Command::new("sh")
+    let child = Command::new("sh")
         .args(["-c", cmd])
-        .output()
-        .await
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
         .map_err(|e| CollectError::Spawn {
             cmd: cmd.to_owned(),
             source: e,
         })?;
 
-    if !output.status.success() {
-        return Err(CollectError::NonZeroExit {
+    // wait_with_output() takes ownership of child.  On timeout the future
+    // is dropped, and kill_on_drop(true) ensures the process is killed.
+    match tokio::time::timeout(CMD_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(output)) => {
+            if !output.status.success() {
+                return Err(CollectError::NonZeroExit {
+                    cmd: cmd.to_owned(),
+                    status: output.status,
+                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                });
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        }
+        Ok(Err(e)) => Err(CollectError::Spawn {
             cmd: cmd.to_owned(),
-            status: output.status,
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        });
+            source: e,
+        }),
+        Err(_) => Err(CollectError::Timeout {
+            cmd: cmd.to_owned(),
+            timeout_secs: CMD_TIMEOUT.as_secs(),
+        }),
     }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn parse_f64(s: &str, cmd: &'static str, field: &'static str) -> Result<f64, CollectError> {
@@ -368,7 +388,6 @@ async fn ws_loop(mut socket: WebSocket) {
     // Send full history as a JSON array (first message).
     {
         let hist = STATE.history.read().await;
-        // Build "[snap1,snap2,...]" from pre-serialised individual JSONs.
         let mut buf = String::with_capacity(hist.len() * 120 + 2);
         buf.push('[');
         for (i, s) in hist.iter().enumerate() {
@@ -379,25 +398,31 @@ async fn ws_loop(mut socket: WebSocket) {
         }
         buf.push(']');
 
-        if socket.send(Message::Text(buf.into())).await.is_err() {
-            return;
+        match tokio::time::timeout(WS_SEND_TIMEOUT, socket.send(Message::Text(buf.into()))).await
+        {
+            Ok(Ok(())) => {}
+            _ => return,
         }
     }
 
-    // Stream live snapshots.
+    // Stream live snapshots with send timeout to detect stalled clients.
     loop {
         match rx.recv().await {
             Ok(json) => {
-                if socket.send(Message::Text((*json).into())).await.is_err() {
-                    return; // client disconnected
+                match tokio::time::timeout(
+                    WS_SEND_TIMEOUT,
+                    socket.send(Message::Text((*json).into())),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    _ => return, // timeout or send error — client is gone
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 eprintln!("[ws] client lagged, skipped {n} messages");
-                // Continue — client misses some frames, no big deal.
             }
             Err(broadcast::error::RecvError::Closed) => {
-                // Sender dropped — server is shutting down.
                 return;
             }
         }
@@ -498,6 +523,7 @@ h1{text-align:center;font-size:1.1rem;color:#7cf;flex-shrink:0}
 <script>
 const MAX=900;
 const STATUS=document.getElementById("status");
+const STALE_MS=5000;
 
 Chart.defaults.color="#ccc";
 Chart.defaults.borderColor="#333";
@@ -533,8 +559,6 @@ function pushOne(chart,val){
   }
 }
 
-// Process a single snapshot — push to charts but do NOT call chart.update().
-// Caller is responsible for batching updates.
 function ingestSnap(d){
   const g=d.gpu;
   pushOne(chGpu,   g?g.gpu_util:null);
@@ -542,7 +566,7 @@ function ingestSnap(d){
   pushOne(chPow,   g?g.power:null);
   pushOne(chOllama,d.ollama_cpu);
   pushOne(chRam,   d.ollama_ram_mib);
-  return d; // pass through for value display
+  return d;
 }
 
 function updateValues(d){
@@ -551,6 +575,10 @@ function updateValues(d){
     vGpu.textContent=g.gpu_util.toFixed(0)+"%";
     vVram.textContent=(g.vram_used/1024).toFixed(1)+" / "+(g.vram_total/1024).toFixed(1)+" GiB";
     vPow.textContent=g.power.toFixed(1)+" W";
+  }else{
+    vGpu.textContent="\u2013";
+    vVram.textContent="\u2013";
+    vPow.textContent="\u2013";
   }
   vOllama.textContent=d.ollama_cpu.toFixed(1)+"%";
   vRam.textContent=(d.ollama_ram_mib/1024).toFixed(2)+" GiB";
@@ -560,34 +588,62 @@ function redrawAll(){
   chGpu.update();chVram.update();chPow.update();chOllama.update();chRam.update();
 }
 
-let ws,retry=0;
+/* ── Throttled rendering (~4 fps) ──────────────────────────────────── */
+let pending=[],lastVal=null,dirty=false;
+setInterval(()=>{
+  if(pending.length){
+    for(const s of pending) lastVal=ingestSnap(s);
+    pending=[];
+    dirty=true;
+    if(lastVal) updateValues(lastVal);
+  }
+  if(dirty){dirty=false;redrawAll();}
+},250);
+
+/* ── WebSocket with reconnect ──────────────────────────────────────── */
+let ws,retry=0,lastMsg=0;
 function connect(){
   ws=new WebSocket("ws://"+location.host+"/ws");
-  ws.onopen=()=>{STATUS.textContent="";retry=0;};
-  ws.onclose=()=>{STATUS.textContent="Disconnected – reconnecting\u2026";setTimeout(connect,Math.min(1000*2**retry++,8000));};
+  ws.onopen=()=>{STATUS.textContent="";retry=0;lastMsg=Date.now();};
+  ws.onclose=()=>{
+    STATUS.textContent="Disconnected \u2013 reconnecting\u2026";
+    setTimeout(connect,Math.min(1000*2**retry++,8000));
+  };
   ws.onerror=()=>ws.close();
 
   let gotHistory=false;
   ws.onmessage=e=>{
+    lastMsg=Date.now();
     const parsed=JSON.parse(e.data);
-
-    if(!gotHistory && Array.isArray(parsed)){
-      // First message: history backfill.
+    if(!gotHistory&&Array.isArray(parsed)){
       gotHistory=true;
-      let last=null;
-      for(const snap of parsed) last=ingestSnap(snap);
-      redrawAll();
-      if(last) updateValues(last);
+      pending=parsed;
       return;
     }
-
-    // Live snapshot.
     if(parsed.error){STATUS.textContent="Server: "+parsed.error;return;}
-    ingestSnap(parsed);
-    redrawAll();
-    updateValues(parsed);
+    pending.push(parsed);
   };
 }
+
+/* ── Stale-data watchdog ───────────────────────────────────────────── */
+setInterval(()=>{
+  if(!lastMsg) return;
+  const age=Date.now()-lastMsg;
+  if(age>STALE_MS){
+    STATUS.textContent="Data stale \u2013 last update "+Math.round(age/1000)+"s ago";
+    if(ws&&ws.readyState===WebSocket.OPEN) ws.close();
+  }
+},1000);
+
+/* ── Page Visibility API ───────────────────────────────────────────── */
+document.addEventListener("visibilitychange",()=>{
+  if(!document.hidden&&lastMsg&&Date.now()-lastMsg>2000){
+    pending=[];
+    if(ws&&(ws.readyState===WebSocket.OPEN||ws.readyState===WebSocket.CONNECTING))
+      ws.close();
+  }
+});
+
 connect();
 </script>
 </body>
